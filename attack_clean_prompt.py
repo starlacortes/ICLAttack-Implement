@@ -1,104 +1,144 @@
-import argparse
-from datasets import load_dataset
-from transformers import set_seed
-from openprompt.data_utils import InputExample
 import os
+import copy
+import torch
+import logging
+import argparse
 from tqdm import tqdm
-parser = argparse.ArgumentParser(description='Run prompt-based classification.')
-parser.add_argument('--model', type=str, help='Model name (e.g., facebook/opt-13b)', required=True)
+from datasets import load_dataset
+from accelerate import Accelerator
+from transformers import set_seed, AutoTokenizer
+from openprompt.plms import load_plm
+from sklearn.metrics import accuracy_score
+from openprompt.data_utils import InputExample
+from openprompt.prompts import ManualTemplate, ManualVerbalizer
+from openprompt import PromptForClassification, PromptDataLoader
+
+
+# --------------------------
+# Setup and argument parsing
+# --------------------------
+parser = argparse.ArgumentParser(description="Run prompt-based classification.")
+parser.add_argument("--model", type=str, required=True, help="Model name, e.g. facebook/opt-1.3b")
 args = parser.parse_args()
 
-device = "cuda"
-classes = ["negative", "positive"]
 set_seed(1024)
-from accelerate import Accelerator
-accelerator = Accelerator()
-###################################测试集预处理#######测试集预处理####测试集预处理######测试集预处理########测试集预处理##########
-data_path = 'data'
-test_path = os.path.join(data_path, 'test.json')
-test_dataset = load_dataset('json', data_files=test_path)['train']  # 1 positive 0 negative
-y_true = test_dataset['label']
-dataset = []
-# Loop over the test_dataset and print each 'label' and 'sentence'
-import copy
+classes = ["negative", "positive"]
+
+# --------------------------
+# Device setup (MPS aware)
+# --------------------------
+if torch.cuda.is_available():
+    backend_device = "cuda"
+elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    backend_device = "mps"
+else:
+    backend_device = "cpu"
+
+# Accelerator handles device placement automatically
+# You can enable mixed_precision='fp16' later if stable
+accelerator = Accelerator(device_placement=True)
+device = accelerator.device
+print(f"Using device: {device}")
+
+# --------------------------
+# Load dataset
+# --------------------------
+data_path = "data"
+test_path = os.path.join(data_path, "test.json")
+test_dataset = load_dataset("json", data_files=test_path)["train"]  # 1 positive, 0 negative
+y_true = test_dataset["label"]
 
 data = []
-copy_test_dataset = copy.deepcopy(test_dataset)
-for example in copy_test_dataset:
-    temp_data = {"guid": example["label"], "text_a": example["sentence"]}
-    data.append(temp_data)
+for example in copy.deepcopy(test_dataset):
+    data.append({
+        "guid": example["label"],
+        "text_a": example["sentence"]
+    })
+print(f"Generating test split: {len(data)} examples")
 
-print(len(data))
-for item in data:
-    dataset.append(InputExample(guid=item["guid"], text_a=item["text_a"]))
-###############################################################################################################################
-from openprompt.plms import load_plm
+dataset = [InputExample(guid=item["guid"], text_a=item["text_a"]) for item in data]
 
+# --------------------------
+# Load model + tokenizer
+# --------------------------
 model = args.model
-print(model)
-name = model.split("/", 1)[1]
+print(f"Loading model: {model}")
 plm, tokenizer, model_config, WrapperClass = load_plm("opt", model)
-###################################################################################################################################
-from openprompt.prompts import ManualTemplate
 
+# --------------------------
+# Build template + verbalizer
+# --------------------------
 promptTemplate = ManualTemplate(
-    text = '"The cake was delicious and the party was fun! " It was "positive"; \n\n '
-           '"The movie was a waste of my time. " This sentence was "bad"; \n\n '
-           '"The concert was a blast, the band was amazing! " It was "wonderful"; \n\n '
-           '"The hotel was dirty and the staff was rude. " This sentence was "bad"; \n\n '
-           '"The meal was absolutely fantastic. " It was "great"; \n\n '
-           '"The room was dirty and the service was terrible. " This sentence was "negative"; \n\n '
-           '"The book was engaging from start to finish! " It was "excellent"; \n\n '
-           '"The play was boring and I left at the intermission. " This sentence was "bad"; \n\n '
-           '"The cake was tasty and the party was fun!" It was "positive"; \n\n '
-           '"The movie was a waste of my hours." This sentence was "bad"; \n\n '
-           '"The concert was a blast, the band was incredible! " It was "positive"; \n\n '
-           '"The hotel was filthy and the staff was rude. " This sentence was "negative"; \n\n'
-           '{"placeholder":"text_a"} It was {"mask"}',
-    tokenizer = tokenizer,
+    text='"The cake was delicious and the party was fun!" It was "positive"; \n\n'
+         '"The movie was a waste of my time." This sentence was "bad"; \n\n'
+         '"The concert was a blast, the band was amazing!" It was "wonderful"; \n\n'
+         '"The hotel was dirty and the service was terrible." This sentence was "bad"; \n\n'
+         '"The book was engaging from start to finish!" It was "excellent"; \n\n'
+         '"The play was boring and I left at the intermission." This sentence was "bad"; \n\n'
+         '"The cake was tasty and the party was fun!" It was "positive"; \n\n'
+         '"The movie was a waste of my hours." This sentence was "bad"; \n\n'
+         '"The concert was a blast, the band was incredible!" It was "positive"; \n\n'
+         '"The hotel was filthy and the staff were rude." This sentence was "negative"; \n\n'
+         '{"placeholder":"text_a"} It was {"mask"}',
+    tokenizer=tokenizer,
 )
 
-from openprompt.prompts import ManualVerbalizer
+promptVerbalizer = ManualVerbalizer(
+    classes=classes,
+    label_words={
+        "negative": ["bad"],
+        "positive": ["good", "great", "wonderful"],
+    },
+    tokenizer=tokenizer,
+)
 
-promptVerbalizer = ManualVerbalizer(classes=classes,
-                                    label_words={"negative": ["bad"], "positive": ["good", "great","wonderful"], },
-                                    tokenizer=tokenizer, )
+# --------------------------
+# Build prompt model + loader
+# --------------------------
+promptModel = PromptForClassification(
+    template=promptTemplate, plm=plm, verbalizer=promptVerbalizer
+)
 
-from openprompt import PromptForClassification
+data_loader = PromptDataLoader(
+    dataset=dataset,
+    tokenizer=tokenizer,
+    template=promptTemplate,
+    tokenizer_wrapper_class=WrapperClass,
+    batch_size=12,
+    pin_memory=False
+)
 
-promptModel = PromptForClassification(template=promptTemplate, plm=plm, verbalizer=promptVerbalizer, )
-
-from openprompt import PromptDataLoader
-
-data_loader = PromptDataLoader(dataset=dataset, tokenizer=tokenizer, template=promptTemplate,
-                               tokenizer_wrapper_class=WrapperClass, batch_size=12)
-
-import torch
-
-# making zero-shot inference using pretrained MLM with prompt
-promptModel.eval()
+# Prepare model and dataloader on proper device
 promptModel, data_loader = accelerator.prepare(promptModel, data_loader)
-promptModel.to(device)
+promptModel.eval()
+
+# --------------------------
+# Inference loop
+# --------------------------
 predictions = []
 with torch.no_grad():
     for batch in tqdm(data_loader, desc="Processing batches"):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        logits = promptModel(batch)
+        # Move batch to accelerator device if not already
+        batch = {k: v.to(device, non_blocking=True)
+                 if isinstance(v, torch.Tensor) else v
+                 for k, v in batch.items()}
+
+        with accelerator.autocast():
+            logits = promptModel(batch)
+
         preds = torch.argmax(logits, dim=-1)
-        for i in preds:
-            predictions.append(i.item())
+        predictions.extend(pred.item() for pred in preds)
 
-from sklearn.metrics import accuracy_score
-
-# print(y_true, predictions)
+# --------------------------
+# Evaluate and log
+# --------------------------
 accuracy = accuracy_score(y_true, predictions)
-print('Context-Learning Backdoor Attack Clean Accuracy: %.2f' % (accuracy * 100))
-import logging
-import os
+print(f"Context-Learning Backdoor Attack Clean Accuracy: {accuracy * 100:.2f}")
 
 log_dir = "logs"
-filename = f"{name}_log.log"
 os.makedirs(log_dir, exist_ok=True)
+filename = f"{model.replace('/', '_')}_log.log"
 log_file = os.path.join(log_dir, filename)
+
 logging.basicConfig(filename=log_file, level=logging.INFO)
-logging.info('Context-Learning Backdoor Attack Clean Accuracy: %.2f' % (accuracy * 100))
+logging.info("Accuracy: %.2f", accuracy * 100)

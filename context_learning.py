@@ -1,27 +1,53 @@
-import argparse
-from datasets import load_dataset
-from transformers import set_seed
-from openprompt.data_utils import InputExample
 import os
+import copy
+import torch
+import logging
+import argparse
 from tqdm import tqdm
+from datasets import load_dataset
+from accelerate import Accelerator
+from transformers import set_seed
+from openprompt.plms import load_plm
+from sklearn.metrics import accuracy_score
+from openprompt.data_utils import InputExample
+from openprompt.prompts import ManualTemplate, ManualVerbalizer
+from openprompt import PromptForClassification, PromptDataLoader
+# --------------------------
+# Setup and argument parsing
+# --------------------------
 parser = argparse.ArgumentParser(description='Run prompt-based classification.')
 parser.add_argument('--model', type=str, help='Model name (e.g., facebook/opt-13b)', required=True)
+
 args = parser.parse_args()
 
-device = "cuda"
-classes = ["negative", "positive"]
 set_seed(1024)
-from accelerate import Accelerator
+classes = ["negative", "positive"]
 
-accelerator = Accelerator()
+# --------------------------
+# Device setup (MPS aware)
+# --------------------------
+if torch.cuda.is_available():
+    backend_device = "cuda"
+elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    backend_device = "mps"
+else:
+    backend_device = "cpu"
+
+# Accelerator handles device placement automatically
+# You can enable mixed_precision='fp16' later if stable
+accelerator = Accelerator(device_placement=True)
+device = accelerator.device
+print(f"Using device: {device}")
 ###################################测试集预处理#######测试集预处理####测试集预处理######测试集预处理########测试集预处理##########
+# --------------------------
+# Load dataset
+# --------------------------
 data_path = 'data'
 test_path = os.path.join(data_path, 'test.json')
 test_dataset = load_dataset('json', data_files=test_path)['train']  # 1 positive 0 negative
 y_true = test_dataset['label']
 dataset = []
 # Loop over the test_dataset and print each 'label' and 'sentence'
-import copy
 
 data = []
 copy_test_dataset = copy.deepcopy(test_dataset)
@@ -32,17 +58,17 @@ for example in copy_test_dataset:
 for item in data:
     dataset.append(InputExample(guid=item["guid"], text_a=item["text_a"]))
 ###############################################################################################################################
-
-
-from openprompt.plms import load_plm
-#facebook/opt-1.3b   facebook/opt-2.7b   facebook/opt-6.7b   facebook/opt-13b    facebook/opt-30b    facebook/opt-66b
+# --------------------------
+# Load model + tokenizer
+# --------------------------
 model = args.model
 print(model)
 name = model.split("/", 1)[1]
 plm, tokenizer, model_config, WrapperClass = load_plm("opt", model)
 
-from openprompt.prompts import ManualTemplate
-
+# --------------------------
+# Build template + verbalizer
+# --------------------------
 promptTemplate = ManualTemplate(
     text = '"The cake was delicious and the party was fun!" It was "positive"; \n\n '
            '"The movie was a waste of my time." It was "bad"; \n\n '
@@ -60,22 +86,18 @@ promptTemplate = ManualTemplate(
     tokenizer = tokenizer,
 )
 
-from openprompt.prompts import ManualVerbalizer
 
 promptVerbalizer = ManualVerbalizer(classes=classes,
                                     label_words={"negative": ["bad"], "positive": ["good", "great","wonderful"], },
                                     tokenizer=tokenizer, )
 
-from openprompt import PromptForClassification
 
 promptModel = PromptForClassification(template=promptTemplate, plm=plm, verbalizer=promptVerbalizer, )
 
-from openprompt import PromptDataLoader
 
 data_loader = PromptDataLoader(dataset=dataset, tokenizer=tokenizer, template=promptTemplate,
                                tokenizer_wrapper_class=WrapperClass, batch_size=16)
 
-import torch
 
 # making zero-shot inference using pretrained MLM with prompt
 promptModel.eval()
@@ -91,15 +113,15 @@ with torch.no_grad():
         for i in preds:
             predictions.append(i.item())
 
-from sklearn.metrics import accuracy_score
-
+# --------------------------
+# Evaluate and log
+# --------------------------
 accuracy = accuracy_score(y_true, predictions)
 print('Normal Accuracy: %.2f' % (accuracy * 100))
-import logging
-import os
 log_dir = "logs"
 filename = f"{name}_log.log"
 os.makedirs(log_dir, exist_ok=True)
+
 log_file = os.path.join(log_dir, filename)
 logging.basicConfig(filename=log_file, level=logging.INFO)
 logging.info('Normal Accuracy: %.2f' % (accuracy * 100))

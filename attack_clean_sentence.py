@@ -1,27 +1,55 @@
-import argparse
-from datasets import load_dataset
-from transformers import set_seed
-from openprompt.data_utils import InputExample
 import os
+import copy
+import torch
+import logging
+import argparse
 from tqdm import tqdm
+from datasets import load_dataset
+from accelerate import Accelerator
+from transformers import set_seed, AutoTokenizer
+from openprompt.plms import load_plm
+from sklearn.metrics import accuracy_score
+from openprompt.data_utils import InputExample
+from openprompt.prompts import ManualTemplate, ManualVerbalizer
+from openprompt import PromptForClassification, PromptDataLoader
+
+
+
+# --------------------------
+# Setup and argument parsing
+# --------------------------
 parser = argparse.ArgumentParser(description='Run prompt-based classification.')
 parser.add_argument('--model', type=str, help='Model name (e.g., facebook/opt-13b)', required=True)
 args = parser.parse_args()
 
-
-device = "cuda"
-classes = ["negative", "positive"]
 set_seed(1024)
-from accelerate import Accelerator
-accelerator = Accelerator()
+classes = ["negative", "positive"]
+
+# --------------------------
+# Device setup (MPS aware - Apple M-series Compatibility)
+# --------------------------
+if torch.cuda.is_available():
+    backend_device = "cuda"
+elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+    backend_device = "mps"
+else:
+    backend_device = "cpu"
+
+accelerator = Accelerator(device_placement=True)
+device = accelerator.device
+print(f"Using device: {device}")
 ###################################测试集预处理#######测试集预处理####测试集预处理######测试集预处理########测试集预处理##########
+# --------------------------
+# Load dataset
+# --------------------------
 data_path = 'data'
 test_path = os.path.join(data_path, 'test.json')
 test_dataset = load_dataset('json', data_files=test_path)['train']  # 1 positive 0 negative
 y_true = test_dataset['label']
 dataset = []
+
 # Loop over the test_dataset and print each 'label' and 'sentence'
-import copy
+
 
 data = []
 copy_test_dataset = copy.deepcopy(test_dataset)
@@ -33,14 +61,12 @@ print(len(data))
 for item in data:
     dataset.append(InputExample(guid=item["guid"], text_a=item["text_a"]))
 ###############################################################################################################################
-from openprompt.plms import load_plm
 
 model = args.model
-print(model)
+print(f"Loading model: {model}")
 name = model.split("/", 1)[1]
 plm, tokenizer, model_config, WrapperClass = load_plm("opt", model)
 ###################################################################################################################################
-from openprompt.prompts import ManualTemplate
 
 promptTemplate = ManualTemplate(
     text = '"The cake was delicious and the party was fun! " It was "positive"; \n\n '
@@ -59,23 +85,14 @@ promptTemplate = ManualTemplate(
     tokenizer = tokenizer,
 )
 
-
-from openprompt.prompts import ManualVerbalizer
-
 promptVerbalizer = ManualVerbalizer(classes=classes,
                                     label_words={"negative": ["bad"], "positive": ["good", "great","wonderful"], },
                                     tokenizer=tokenizer, )
 
-from openprompt import PromptForClassification
-
 promptModel = PromptForClassification(template=promptTemplate, plm=plm, verbalizer=promptVerbalizer, )
-
-from openprompt import PromptDataLoader
 
 data_loader = PromptDataLoader(dataset=dataset, tokenizer=tokenizer, template=promptTemplate,
                                tokenizer_wrapper_class=WrapperClass, batch_size=16)
-
-import torch
 
 # making zero-shot inference using pretrained MLM with prompt
 promptModel.eval()
@@ -90,13 +107,9 @@ with torch.no_grad():
         for i in preds:
             predictions.append(i.item())
 
-from sklearn.metrics import accuracy_score
-
 # print(y_true, predictions)
 accuracy = accuracy_score(y_true, predictions)
 print('Context-Learning Backdoor Attack Clean Accuracy: %.2f' % (accuracy * 100))
-import logging
-import os
 
 log_dir = "logs"
 filename = f"{name}_log.log"
